@@ -242,7 +242,9 @@ class DiagKDN(nn.Module):
             k = F.silu(self.k_proj(hidden_states))
             v = F.silu(self.v_proj(hidden_states))
 
-        q, k, g = (rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim) for x in (q, k, self.f_proj(hidden_states)))
+        q, k = (rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim) for x in (q, k))
+        # the gate gradient is rounded to the dtype of g, so g is kept in fp32 to sum the dt_bias gradient in fp32
+        g = rearrange(self.f_proj(hidden_states).float(), "... (h d) -> ... h d", d=self.head_k_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
         omega = rearrange(self.omega_proj(hidden_states), "... (h d) -> ... h d", d=self.head_k_dim)
         omega = self.omega_min + F.softplus(omega.float())

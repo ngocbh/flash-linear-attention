@@ -8,6 +8,7 @@
 import torch
 
 from fla.modules.l2norm import l2norm
+from fla.ops.diag_kdn.chunk import MIN_LOG_DECAY
 from fla.ops.diag_kdn.gain import diag_kdn_gain
 from fla.ops.generalized_delta_rule.dplr import fused_recurrent_dplr_delta_rule
 from fla.ops.kda.gate import fused_kda_gate
@@ -78,9 +79,8 @@ def fused_recurrent_diag_kdn(
             Final memory of shape ``[N, H, K, V]`` and precision of shape ``[N, H, K]``
             if ``output_final_state=True`` else `None`.
     """
-    # options of the chunked memory update have no effect on the recurrent one
-    for key in ('safe_gate', 'lower_bound', 'chunk_size', 'disable_recompute', 'cu_seqlens_cpu'):
-        kwargs.pop(key, None)
+    # the recurrent kernel does not need the CPU copy of the sequence lengths
+    kwargs.pop('cu_seqlens_cpu', None)
     if kwargs:
         raise TypeError(f"Unexpected arguments for DiagKDN: {', '.join(kwargs)}.")
     if use_gate_in_kernel and A_log is None:
@@ -103,7 +103,9 @@ def fused_recurrent_diag_kdn(
         info_scale=info_scale,
         cu_seqlens=cu_seqlens,
     )
+    # S_t = (Diag(exp(g_t)) - kappa_t (exp(g_t) * k_t)^T) S_{t-1} + kappa_t v_t^T,
     # the recurrent kernel computes in float32, so the gain is passed at full precision
+    g = g.clamp_min(MIN_LOG_DECAY)
     o, ht = fused_recurrent_dplr_delta_rule(
         q=q,
         k=kappa,

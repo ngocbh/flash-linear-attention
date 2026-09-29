@@ -76,7 +76,8 @@ def diag_kdn_gain_fwd_kernel_map(
         b_nB = b_tA * b_mB + b_tB * b_mD
         b_nC = b_tC * b_mA + b_tD * b_mC
         b_nD = b_tC * b_mB + b_tD * b_mD
-        b_scale = 1. / tl.maximum(tl.maximum(tl.maximum(tl.abs(b_nA), tl.abs(b_nB)), tl.maximum(tl.abs(b_nC), tl.abs(b_nD))), 1e-30)
+        b_scale = 1. / tl.maximum(tl.maximum(tl.maximum(tl.abs(b_nA), tl.abs(b_nB)),
+                                  tl.maximum(tl.abs(b_nC), tl.abs(b_nD))), 1e-30)
         b_mA, b_mB, b_mC, b_mD = b_nA * b_scale, b_nB * b_scale, b_nC * b_scale, b_nD * b_scale
 
     o_m = (i_tg * H + i_h) * 4 * K

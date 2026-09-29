@@ -5,14 +5,248 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import math
+
 import torch
 
 from fla.modules.l2norm import l2norm
+from fla.ops.diag_kdn.chunk_h import chunk_diag_kdn_bwd_dhu, chunk_diag_kdn_fwd_h
+from fla.ops.diag_kdn.chunk_intra import chunk_diag_kdn_bwd_intra, chunk_diag_kdn_fwd_intra
+from fla.ops.diag_kdn.chunk_o import chunk_diag_kdn_bwd_dAv, chunk_diag_kdn_fwd_o
 from fla.ops.diag_kdn.gain import diag_kdn_gain
-from fla.ops.generalized_delta_rule.dplr import chunk_dplr_delta_rule
+from fla.ops.diag_kdn.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 from fla.ops.kda.gate import fused_kda_gate
+from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
+from fla.ops.utils.constant import RCP_LN2
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+
+# the memory floors the per-step decay at 1e-6, the gain sees the unclamped decay
+MIN_LOG_DECAY = math.log(1e-6)
 
 
+def chunk_diag_kdn_memory_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    kappa: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
+    chunk_size: int = 32,
+):
+    w, u, kg, Aqk, Akk = chunk_diag_kdn_fwd_intra(
+        q=q,
+        k=k,
+        kappa=kappa,
+        v=v,
+        gk=g,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+    )
+    h, v_new, final_state = chunk_diag_kdn_fwd_h(
+        k=kg,
+        w=w,
+        u=u,
+        gk=g,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    o = chunk_diag_kdn_fwd_o(
+        q=q,
+        v=v_new,
+        g=g,
+        A=Aqk,
+        h=h,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+    )
+    return o, Aqk, Akk, final_state
+
+
+def chunk_diag_kdn_memory_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    kappa: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    Aqk: torch.Tensor,
+    Akk: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    do: torch.Tensor,
+    dht: torch.Tensor | None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
+    chunk_size: int = 32,
+):
+    w, u, kg, qg = recompute_w_u_fwd(
+        k=k,
+        kappa=kappa,
+        v=v,
+        A=Akk,
+        gk=g,
+        q=q,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    h, v_new, _ = chunk_diag_kdn_fwd_h(
+        k=kg,
+        w=w,
+        u=u,
+        gk=g,
+        initial_state=initial_state,
+        output_final_state=False,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    dAqk, dv = chunk_diag_kdn_bwd_dAv(
+        v=v_new,
+        do=do,
+        A=Aqk,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+    )
+    dh, dh0, du = chunk_diag_kdn_bwd_dhu(
+        q=qg,
+        k=kg,
+        w=w,
+        gk=g,
+        do=do,
+        dv=dv,
+        h0=initial_state,
+        dht=dht,
+        scale=scale,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    dq, dk, dkappa, dv, dg, dAkk = prepare_wy_repr_bwd(
+        q=q,
+        k=k,
+        kappa=kappa,
+        v=v,
+        v_new=v_new,
+        g=g,
+        A=Akk,
+        h=h,
+        do=do,
+        dh=dh,
+        du=du,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    dq, dk, dkappa, dg = chunk_diag_kdn_bwd_intra(
+        q=q,
+        k=k,
+        kappa=kappa,
+        g=g,
+        dAqk=dAqk,
+        dAkk=dAkk,
+        dq=dq,
+        dk=dk,
+        dkappa=dkappa,
+        dg=dg,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+    )
+    # `dg` is w.r.t. the chunk-local cumulative gates, the reverse cumsum maps it back to the raw gates
+    dg = chunk_local_cumsum(
+        g=dg,
+        chunk_size=chunk_size,
+        reverse=True,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    return dq, dk, dkappa, dv, dg, dh0
+
+
+class ChunkDiagKDNMemoryFunction(torch.autograd.Function):
+
+    @staticmethod
+    @input_guard
+    @autocast_custom_fwd
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        kappa: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        scale: float,
+        initial_state: torch.Tensor | None,
+        output_final_state: bool,
+        cu_seqlens: torch.LongTensor | None = None,
+        cu_seqlens_cpu: torch.LongTensor | None = None,
+    ):
+        chunk_size = 32
+        chunk_indices = None
+        if cu_seqlens is not None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu)
+        g = chunk_local_cumsum(
+            g=g,
+            chunk_size=chunk_size,
+            scale=RCP_LN2,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        o, Aqk, Akk, final_state = chunk_diag_kdn_memory_fwd(
+            q=q,
+            k=k,
+            kappa=kappa,
+            v=v,
+            g=g,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
+        )
+        ctx.save_for_backward(q, k, kappa, v, g, Aqk, Akk, initial_state, cu_seqlens, chunk_indices)
+        ctx.scale = scale
+        ctx.chunk_size = chunk_size
+        return o.to(q.dtype), final_state
+
+    @staticmethod
+    @input_guard
+    @autocast_custom_bwd
+    def backward(ctx, do: torch.Tensor, dht: torch.Tensor | None):
+        q, k, kappa, v, g, Aqk, Akk, initial_state, cu_seqlens, chunk_indices = ctx.saved_tensors
+        dq, dk, dkappa, dv, dg, dh0 = chunk_diag_kdn_memory_bwd(
+            q=q,
+            k=k,
+            kappa=kappa,
+            v=v,
+            g=g,
+            Aqk=Aqk,
+            Akk=Akk,
+            scale=ctx.scale,
+            initial_state=initial_state,
+            do=do,
+            dht=dht,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=ctx.chunk_size,
+        )
+        return dq.to(q), dk.to(k), dkappa.to(kappa), dv.to(v), dg, None, dh0, None, None, None
+
+
+@torch.compiler.disable
 def chunk_diag_kdn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -41,7 +275,8 @@ def chunk_diag_kdn(
         S_t \leftarrow S_t + \kappa_t (v_t - S_t^\top k_t)^\top,
 
     where ``kappa`` is the diagonal Kalman gain, see :func:`fla.ops.diag_kdn.gain.diag_kdn_gain`.
-    The update is a diagonal-plus-low-rank recurrence computed by :func:`fla.ops.generalized_delta_rule.dplr`.
+    The memory update runs on chunks of 32 steps with float32 states and write keys,
+    and floors the per-step decay ``exp(g_t)`` at ``1e-6``.
 
     Args:
         q (torch.Tensor):
@@ -83,9 +318,6 @@ def chunk_diag_kdn(
             consistent with the FlashAttention API. Default: `None`.
         cu_seqlens_cpu (torch.LongTensor, Optional):
             CPU copy of ``cu_seqlens`` that avoids a device synchronization. Default: `None`.
-        kwargs:
-            Options of the memory update, e.g., ``safe_gate`` and ``chunk_size``,
-            passed to :func:`fla.ops.generalized_delta_rule.dplr.chunk_dplr_delta_rule`.
 
     Returns:
         o (torch.Tensor):
@@ -127,11 +359,15 @@ def chunk_diag_kdn(
             cu_seqlens=cu_seqlens,
         )
     """
-    if kwargs.get('cp_context') is not None:
+    if kwargs.pop('cp_context', None) is not None:
         raise NotImplementedError("Context parallelism is not supported for DiagKDN yet.")
+    if kwargs:
+        raise TypeError(f"Unexpected arguments for DiagKDN: {', '.join(kwargs)}.")
     if use_gate_in_kernel and A_log is None:
         raise ValueError("`A_log` must be provided when `use_gate_in_kernel=True`.")
     assert v.shape[2] == q.shape[2], "DiagKDN does not support grouped value attention."
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
     h0, c0 = initial_state if initial_state is not None else (None, None)
     if c0 is not None:
         assert c0.dtype == torch.float32, "The initial precision must be in float32."
@@ -151,20 +387,16 @@ def chunk_diag_kdn(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
     )
-    # S_t = (Diag(exp(g_t)) - kappa_t (exp(g_t) * k_t)^T) S_{t-1} + kappa_t v_t^T
-    kappa = kappa.to(q.dtype)
-    o, ht = chunk_dplr_delta_rule(
-        q=q,
-        k=kappa,
-        v=v,
-        a=(g.exp() * k).to(q.dtype),
-        b=-kappa,
-        gk=g,
-        scale=scale,
-        initial_state=h0,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        **kwargs,
+    o, ht = ChunkDiagKDNMemoryFunction.apply(
+        q,
+        k.to(q.dtype),
+        kappa,
+        v,
+        g.clamp_min(MIN_LOG_DECAY),
+        scale,
+        h0,
+        output_final_state,
+        cu_seqlens,
+        cu_seqlens_cpu,
     )
     return o, ((ht, ct) if output_final_state else None)
